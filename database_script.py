@@ -284,7 +284,7 @@ def main():
     if st.button("Fetch Clients and Generate Replies"):
         if salesRep_name.strip() and days:
             client_ids = get_assigned_employee_clients(salesRep_name, days)
-            print(client_ids)
+            st.write(f"Client IDs: {client_ids}")
             if client_ids:
                 ai_responses = []
 
@@ -293,7 +293,7 @@ def main():
                     
                     if chat_transcript:
                         ai_response = get_client_info(chat_transcript, client_name, assigned_employee_name)
-                        print(ai_response)
+                        st.write(f"AI Response of Client Id:{client_id} ==> {ai_response}")
                         ai_responses.append(ai_response)
                     else:
                         st.warning(f"No chat data found for Client ID: {client_id}")
@@ -301,7 +301,7 @@ def main():
                 consolidated_chat_info = "\n\n".join(ai_responses)
                 performance_response = get_sales_rep_performance(consolidated_chat_info)
 
-                st.subheader("Sales Rep Performance Summary")
+                st.subheader("Sales Rep Final Performance Summary")
                 st.text(performance_response)
             else:
                 st.warning(f"No clients found for Sales Rep {salesRep_name} in the last {days} days.")
