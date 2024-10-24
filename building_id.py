@@ -97,7 +97,6 @@ def extract_building_options(messages):
 def get_building_id(session, building_name, building_address):
     """Fetch building ID from the database based on name and address."""
     building = session.query(Building.id).filter(
-        Building.name == building_name,
         Building.address == building_address
     ).first()
 

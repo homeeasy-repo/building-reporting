@@ -1,14 +1,14 @@
 import psycopg2
 import os
 import csv
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 from fub_chat import fetch_chat_data
 import google.generativeai as genai
-from dotenv import load_dotenv
-from datetime import datetime
 from building_id import process_clients_for_sales_rep  
 from selected_building_id import seleted_building
+from dotenv import load_dotenv
 
 load_dotenv()
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -233,6 +233,153 @@ def get_sales_rep_performance(chat_info):
 # if __name__ == "__main__":
 #     main()
 
+def get_lead_progress_report(database_url, sales_rep_name, weeks):
+    try:
+        conn = psycopg2.connect(database_url)
+        cur = conn.cursor()
+
+        # Format the interval string
+        interval_string = f"{weeks} week"
+
+        query = """
+        SELECT c.id, c.fullname, c.addresses, c.created 
+        FROM client c
+        JOIN employee e ON c.assigned_employee = e.id
+        WHERE e.fullname = %s
+        AND c.created >= NOW() - INTERVAL %s;
+        """
+
+        cur.execute(query, (sales_rep_name, interval_string))
+        result = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        return result
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+        return None
+
+def format_address(address_list):
+    """Format the client address from a list of address components into a readable string."""
+    if address_list and isinstance(address_list, list):
+        address_components = address_list[0]  
+        city = address_components.get('city', '')
+        state = address_components.get('state', '')
+        street = address_components.get('street', '')
+        country = address_components.get('country', '')
+        return f"{street}, {city}, {state}, {country}".strip(", ")
+    return "Address Not Available"
+
+def get_client_info_for_tour(chat_transcript):
+    model = genai.GenerativeModel(model_name="gemini-1.5-pro-latest")
+    response = model.generate_content([f"""
+        Please analyze the provided chat transcript and extract the following details for the client interaction:
+        If any of the details are not available, print "Not Found" for that specific field:
+
+        For what day client booked tour: {{"tour_booking_day": "Not Found"}}  
+        Client Tour the Building (Y/N): {{"client_tour": "Not Found"}}  
+        Actual Tour Executed: {{"actual_tour_day": "Not Found"}}  
+        Applied for Application (Y/N): {{"applied_for_application": "Not Found"}}  
+        Applied for Application (Day/Date): {{"application_date": "Not Found"}}  
+        Application Approved (Y/N): {{"application_approved": "Not Found"}}  
+        Application Approval Date/Day: {{"approval_date": "Not Found"}}   
+
+        Ensure that the extracted information is accurate and formatted clearly. 
+        For any field without available data, please indicate "Not Found." Thank you!
+        Here is the chat: {chat_transcript}
+    """])
+
+    content = response.text
+    
+    content = content.replace('```json', '').replace('```', '').strip()
+    
+    content = content.strip('{}')
+    extracted_info = {}
+
+    for part in content.split(','):
+        if ':' in part:
+            key, value = part.split(':', 1)
+            cleaned_key = key.strip().replace('"', '').strip()
+            cleaned_value = value.strip().replace('"', '').strip()
+            extracted_info[cleaned_key] = cleaned_value
+    
+    return extracted_info
+
+
+
+from io import StringIO  # Import StringIO for text-based in-memory operations
+
+def generate_csv_report(database_url, sales_rep_name, weeks):
+    leads = get_lead_progress_report(database_url, sales_rep_name, weeks)
+
+    if not leads:
+        st.warning(f"No leads found for {sales_rep_name} in the last {weeks} weeks.")
+        return
+
+    csv_data = []
+    csv_headers = [
+        "Client ID","Client Name", "Client Address", "Lead Created Date", "Sales Rep Name",
+        "Sent Building Options ID", "Client Selected Building (Y/N)", 
+        "Selected Building ID", "For what day client booked tour", 
+        "Client Tour the Building (Y/N)", "Actual Tour Executed",
+        "Applied for Application (Y/N)", "Applied for Application (Day/Date)",
+        "Application Approved (Y/N)", "Application Approval Date/Day"
+    ]
+
+    building_data = process_clients_for_sales_rep(sales_rep_name, weeks)
+    selected_building_data = seleted_building(sales_rep_name, weeks)
+
+    if building_data is None:
+        st.error(f"Could not fetch building data for {sales_rep_name} in the last {weeks} weeks.")
+        return
+
+    for lead in leads:
+        client_id, client_name, client_address, created_date = lead
+        formatted_address = format_address(client_address)
+
+        building_ids = set()
+        selected_Building_IDs = set()
+
+        for building_client in building_data:
+            if building_client['client_id'] == client_id:
+                building_ids.add(building_client['building_id'])
+        
+        for client_building in selected_building_data:
+            if client_building['client_id'] == client_id:
+                selected_Building_IDs.add(client_building['building_id'])
+
+        building_ids_str = ', '.join(map(str, sorted(building_ids))) if building_ids else "Not Found"
+        selected_building_ids_str = ', '.join(map(str, sorted(selected_Building_IDs))) if selected_Building_IDs else "Not Found"
+
+        chat_transcript = fetch_chat_data(DATABASE_URL, client_id)
+        tour_info = get_client_info_for_tour(chat_transcript)
+
+        csv_row = [
+            client_id,client_name, formatted_address, created_date, sales_rep_name,
+            building_ids_str, 
+            "N" if "Not Found" in selected_building_ids_str else "Y",  
+            selected_building_ids_str,  
+            tour_info.get("tour_booking_day"),  
+            tour_info.get("client_tour"),  
+            tour_info.get("actual_tour_day"),  
+            tour_info.get("applied_for_application"),  
+            tour_info.get("application_date"),
+            tour_info.get("application_approved"), 
+            tour_info.get("approval_date")
+        ]
+        csv_data.append(csv_row)
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(csv_headers)
+    writer.writerows(csv_data)
+    
+    output.seek(0)
+
+    csv_filename = f"Lead_Progress_Report_{sales_rep_name}_{weeks}_weeks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    st.download_button(label="Download CSV", data=output.getvalue(), file_name=csv_filename, mime='text/csv')
 
 def main():
     st.header('Sent Buildings with Additional Building Info')
@@ -312,158 +459,6 @@ def main():
         else:
             st.warning("Please select a valid Sales Rep and number of days.")
 
-def get_lead_progress_report(database_url, sales_rep_name, weeks):
-    try:
-        conn = psycopg2.connect(database_url)
-        cur = conn.cursor()
-
-        # Format the interval string
-        interval_string = f"{weeks} week"
-
-        query = """
-        SELECT c.id, c.fullname, c.addresses, c.created 
-        FROM client c
-        JOIN employee e ON c.assigned_employee = e.id
-        WHERE e.fullname = %s
-        AND c.created >= NOW() - INTERVAL %s;
-        """
-
-        cur.execute(query, (sales_rep_name, interval_string))
-        result = cur.fetchall()
-
-        cur.close()
-        conn.close()
-
-        return result
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-        return None
-
-def format_address(address_list):
-    """Format the client address from a list of address components into a readable string."""
-    if address_list and isinstance(address_list, list):
-        address_components = address_list[0]  
-        city = address_components.get('city', '')
-        state = address_components.get('state', '')
-        street = address_components.get('street', '')
-        country = address_components.get('country', '')
-        return f"{street}, {city}, {state}, {country}".strip(", ")
-    return "Address Not Available"
-
-def get_client_info_for_tour(chat_transcript):
-    model = genai.GenerativeModel(model_name="gemini-1.5-pro-latest")
-    response = model.generate_content([f"""
-        Please analyze the provided chat transcript and extract the following details for the client interaction:
-        If any of the details are not available, print "Not Found" for that specific field:
-
-        For what day client booked tour: {{"tour_booking_day": "Not Found"}}  
-        Client Tour the Building (Y/N): {{"client_tour": "Not Found"}}  
-        Actual Tour Executed: {{"actual_tour_day": "Not Found"}}  
-        Applied for Application (Y/N): {{"applied_for_application": "Not Found"}}  
-        Applied for Application (Day/Date): {{"application_date": "Not Found"}}  
-        Application Approved (Y/N): {{"application_approved": "Not Found"}}  
-        Application Approval Date/Day: {{"approval_date": "Not Found"}}   
-
-        Ensure that the extracted information is accurate and formatted clearly. 
-        For any field without available data, please indicate "Not Found." Thank you!
-        Here is the chat: {chat_transcript}
-    """])
-
-    content = response.text
-    
-    content = content.replace('```json', '').replace('```', '').strip()
-    
-    # Manually clean and parse the dictionary-like string
-    content = content.strip('{}')  # Remove outer braces
-    extracted_info = {}
-    
-    # Now split the content into key-value pairs
-    for part in content.split(','):
-        if ':' in part:
-            key, value = part.split(':', 1)
-            cleaned_key = key.strip().replace('"', '').strip()
-            cleaned_value = value.strip().replace('"', '').strip()
-            extracted_info[cleaned_key] = cleaned_value
-    
-    return extracted_info
-
-
-
-from io import StringIO  # Import StringIO for text-based in-memory operations
-
-def generate_csv_report(database_url, sales_rep_name, weeks):
-    leads = get_lead_progress_report(database_url, sales_rep_name, weeks)
-
-    if not leads:
-        st.warning(f"No leads found for {sales_rep_name} in the last {weeks} weeks.")
-        return
-
-    csv_data = []
-    csv_headers = [
-        "Client Name", "Client Address", "Lead Created Date", "Sales Rep Name",
-        "Sent Building Options ID", "Client Selected Building (Y/N)", 
-        "Selected Building ID", "For what day client booked tour", 
-        "Client Tour the Building (Y/N)", "Actual Tour Executed",
-        "Applied for Application (Y/N)", "Applied for Application (Day/Date)",
-        "Application Approved (Y/N)", "Application Approval Date/Day"
-    ]
-
-    building_data = process_clients_for_sales_rep(sales_rep_name, weeks)
-    selected_building_data = seleted_building(sales_rep_name, weeks)
-
-    if building_data is None:
-        st.error(f"Could not fetch building data for {sales_rep_name} in the last {weeks} weeks.")
-        return
-
-    for lead in leads:
-        client_id, client_name, client_address, created_date = lead
-        formatted_address = format_address(client_address)
-
-        building_ids = set()
-        selected_Building_IDs = set()
-
-        for building_client in building_data:
-            if building_client['client_id'] == client_id:
-                building_ids.add(building_client['building_id'])
-        
-        for client_building in selected_building_data:
-            if client_building['client_id'] == client_id:
-                selected_Building_IDs.add(client_building['building_id'])
-
-        building_ids_str = ', '.join(map(str, sorted(building_ids))) if building_ids else "Not Found"
-        selected_building_ids_str = ', '.join(map(str, sorted(selected_Building_IDs))) if selected_Building_IDs else "Not Found"
-
-        chat_transcript = fetch_chat_data(DATABASE_URL, client_id)
-        tour_info = get_client_info_for_tour(chat_transcript)
-
-        csv_row = [
-            client_name, formatted_address, created_date, sales_rep_name,
-            building_ids_str, 
-            "N" if "Not Found" in selected_building_ids_str else "Y",  
-            selected_building_ids_str,  
-            tour_info.get("tour_booking_day"),  
-            tour_info.get("client_tour"),  
-            tour_info.get("actual_tour_day"),  
-            tour_info.get("applied_for_application"),  
-            tour_info.get("application_date"),
-            tour_info.get("application_approved"), 
-            tour_info.get("approval_date")
-        ]
-        csv_data.append(csv_row)
-
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(csv_headers)
-    writer.writerows(csv_data)
-    
-    output.seek(0)
-
-    csv_filename = f"Lead_Progress_Report_{sales_rep_name}_{weeks}_weeks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    st.download_button(label="Download CSV", data=output.getvalue(), file_name=csv_filename, mime='text/csv')
-
-
-def main():
     st.header("Lead Progress Tour Report")
 
     sales_rep_name = st.selectbox("Select Sales Rep:", ["","Alina Victor", "Ryan Rehman", "Waseem Zubair", "Sara Edward", "John Green", "James Hanan", "Bill Smith", "Brad Steele", "Brandon Wilson", "Thomas Junior"])
